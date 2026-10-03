@@ -3,6 +3,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 from .audit import audit_hash, canonical_json
+from . import rules
 from .domain import ConflictError, NotFoundError, DomainError
 
 
@@ -72,8 +73,30 @@ class Repository:
                 );
                 """
             )
+            self._migrate_observation_version(conn)
         finally:
             conn.close()
+
+    def _migrate_observation_version(self, conn):
+        """旧数据升级：缺少观测版本的接近事件补成初始版本，审计记录保持不变。"""
+        rows = conn.execute("SELECT id, payload FROM items").fetchall()
+        pending = []
+        for row in rows:
+            payload = json.loads(row["payload"])
+            obs_version = payload.get("observation_version")
+            if not isinstance(obs_version, int) or obs_version < 1:
+                payload["observation_version"] = 1
+                pending.append((canonical_json(payload), row["id"]))
+        if not pending:
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for payload_text, item_id in pending:
+                conn.execute("UPDATE items SET payload=? WHERE id=?", (payload_text, item_id))
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def _row_to_item(self, row):
         if row is None:
@@ -160,13 +183,15 @@ class Repository:
         finally:
             conn.close()
 
-    def add_source(self, item_id, source_type, external_id, payload, observed_at, actor, role):
+    def add_source(self, item_id, source_type, external_id, payload, observed_at, actor, role, expected_version=None):
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            item = conn.execute("SELECT id FROM items WHERE id=?", (item_id,)).fetchone()
-            if item is None:
+            row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if row is None:
                 raise NotFoundError("item_not_found", "业务实体不存在")
+            if expected_version is not None and int(expected_version) != int(row["version"]):
+                raise ConflictError("version_conflict", "记录已被其他操作更新，请重新读取后重算")
             try:
                 conn.execute(
                     "INSERT INTO sources(item_id,source_type,external_id,payload,observed_at,created_at) VALUES(?,?,?,?,?,?)",
@@ -175,16 +200,39 @@ class Repository:
             except sqlite3.IntegrityError:
                 raise ConflictError("duplicate_source", "同一来源记录已经提交")
             source_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            # 轨道观测一更新，旧评估和规避方案即失效，需要重走审批。
+            current_payload = json.loads(row["payload"])
+            new_status, invalidated = rules.invalidate_for_observation(current_payload)
+            version = int(row["version"]) + 1
+            conn.execute(
+                "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
+                (new_status, version, canonical_json(current_payload), now_iso(), item_id),
+            )
             self.append_audit(
                 conn,
                 item_id,
                 "source_recorded",
                 actor,
                 role,
-                {"source_id": source_id, "source_type": source_type, "external_id": external_id},
+                {
+                    "source_id": source_id,
+                    "source_type": source_type,
+                    "external_id": external_id,
+                    "observation_version": invalidated["observation_version"],
+                },
             )
+            self.append_audit(conn, item_id, "observation_invalidated", actor, role, invalidated)
             conn.execute("COMMIT")
-            return {"id": source_id, "item_id": item_id, "source_type": source_type, "external_id": external_id, "payload": payload, "observed_at": observed_at}
+            return {
+                "id": source_id,
+                "item_id": item_id,
+                "source_type": source_type,
+                "external_id": external_id,
+                "payload": payload,
+                "observed_at": observed_at,
+                "observation_version": invalidated["observation_version"],
+                "version": version,
+            }
         except Exception:
             try:
                 conn.execute("ROLLBACK")

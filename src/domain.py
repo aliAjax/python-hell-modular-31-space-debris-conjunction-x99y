@@ -85,6 +85,7 @@ def normalize_create(payload):
         "fuel_budget_m_s": fuel_budget,
         "track_age_hours": track_age,
         "operating_organizations": [item.strip() for item in operators],
+        "observation_version": 1,
         "revisions": [],
         "opinions": [],
         "conflict": False,

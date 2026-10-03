@@ -17,11 +17,13 @@ class Service:
             rules.ENTITY_TYPE, stable_key, rules.INITIAL_STATUS, normalized, actor, role
         )
 
-    def add_source(self, item_id, payload, actor, role, region=None):
+    def add_source(self, item_id, payload, actor, role, region=None, expected_version=None):
         if not actor or not role:
             raise DomainError("identity_required", "需要用户身份和角色", 401)
         if role not in rules.SOURCE_ROLES:
             raise DomainError("forbidden", "当前角色不能提交来源记录", 403)
+        if expected_version is None:
+            raise DomainError("expected_version_required", "提交观测需要 expected_version", 400)
         item = self.repository.get_item(item_id)
         normalized = domain.normalize_source(payload)
         if region and rules.ENFORCE_REGION and role != "regulator" and normalized.get("region") and normalized["region"] != region:
@@ -34,6 +36,7 @@ class Service:
             normalized.pop("observed_at"),
             actor,
             role,
+            expected_version,
         )
         return result
 
