@@ -9,13 +9,14 @@ ACTION_ROLES = {
     "record_opinion": {"operator"},
     "approve": {"coordinator"},
     "execute": {"operator"},
+    "execution_update": {"operator"},
     "resolve": {"coordinator"},
     "cancel": {"coordinator"},
     "report_revision": {"analyst"},
 }
 ENFORCE_REGION = False
 REGION_SENSITIVE_ACTIONS = set()
-ACTION_REQUIRES_VERSION = {"approve", "execute", "resolve", "cancel"}
+ACTION_REQUIRES_VERSION = {"approve", "execute", "execution_update", "resolve", "cancel", "report_revision"}
 
 
 def assess(payload):
@@ -55,6 +56,13 @@ def _require_text(payload, name):
     return value.strip()
 
 
+def _string_list(payload, name):
+    value = payload.get(name)
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+        raise DomainError("invalid_steps", "%s 必须是字符串列表" % name)
+    return [item.strip() for item in value]
+
+
 def apply_action(item, action, payload, actor, role):
     status = item["status"]
     current = dict(item["payload"])
@@ -82,8 +90,24 @@ def apply_action(item, action, payload, actor, role):
         current.setdefault("revisions", []).append(revision)
         current["miss_distance_m"] = revision["miss_distance_m"]
         current["covariance_m"] = revision["covariance_m"]
-        current["assessment"] = assess(current)
-        return status, current, {"revision": revision}
+        current["observation_version"] = int(current.get("observation_version", 1)) + 1
+        result = assess(current)
+        current["assessment"] = result
+        # 观测一旦更新，基于旧观测的评估结论、规避方案、运营方签字和执行进度全部作废
+        invalidated = {}
+        for key in ("approved_maneuver", "command_ref", "execution"):
+            if key in current:
+                invalidated[key] = current.pop(key)
+        if current.get("opinions"):
+            invalidated["opinions"] = current["opinions"]
+        current["opinions"] = []
+        current["conflict"] = False
+        return "assessed", current, {
+            "revision": revision,
+            "observation_version": current["observation_version"],
+            "assessment": result,
+            "invalidated": invalidated,
+        }
 
     if action == "record_opinion":
         _need_status(item, {"assessed", "coordinating"})
@@ -106,18 +130,74 @@ def apply_action(item, action, payload, actor, role):
         if fuel > budget:
             raise DomainError("fuel_budget_exceeded", "规避燃料超过预算", 409)
         window = _require_text(payload, "maneuver_window")
-        current["approved_maneuver"] = {"fuel_cost_m_s": fuel, "maneuver_window": window}
+        current["approved_maneuver"] = {
+            "fuel_cost_m_s": fuel,
+            "maneuver_window": window,
+            "observation_version": int(current.get("observation_version", 1)),
+        }
         return "coordinating", current, {"approved_maneuver": current["approved_maneuver"]}
 
     if action == "execute":
         _need_status(item, {"coordinating"})
         command_ref = _require_text(payload, "command_ref")
+        requested = None
+        if payload.get("steps") is not None:
+            requested = _string_list(payload, "steps")
+        execution = current.get("execution") or {"steps": {}, "attempts": 0}
+        steps = execution.setdefault("steps", {})
+        if requested:
+            repeated = [name for name in requested if steps.get(name) == "done"]
+            if repeated:
+                raise DomainError("steps_already_completed", "已完成的动作不能重复执行: %s" % ",".join(repeated), 409)
+            for name in requested:
+                steps.setdefault(name, "pending")
+        incomplete = [name for name, state in steps.items() if state != "done"]
+        execution["attempts"] = int(execution.get("attempts", 0)) + 1
+        execution["command_ref"] = command_ref
+        current["execution"] = execution
         current["command_ref"] = command_ref
-        return "executing", current, {"command_ref": command_ref}
+        return "executing", current, {
+            "command_ref": command_ref,
+            "attempt": execution["attempts"],
+            "retry_steps": incomplete,
+        }
+
+    if action == "execution_update":
+        _need_status(item, {"executing"})
+        execution = current.get("execution")
+        if not execution:
+            raise DomainError("no_execution", "当前没有执行中的规避动作")
+        steps = execution.setdefault("steps", {})
+        completed = _string_list(payload, "completed") if payload.get("completed") is not None else []
+        failed = _string_list(payload, "failed") if payload.get("failed") is not None else []
+        if not completed and not failed:
+            raise DomainError("field_required", "completed 或 failed 至少上报一项")
+        overlap = sorted(set(completed) & set(failed))
+        if overlap:
+            raise DomainError("step_state_conflict", "同一动作不能既完成又失败: %s" % ",".join(overlap))
+        unknown = [name for name in completed + failed if name not in steps]
+        if unknown:
+            raise DomainError("unknown_step", "未登记的执行动作: %s" % ",".join(unknown))
+        for name in completed:
+            steps[name] = "done"
+        for name in failed:
+            steps[name] = "failed"
+        event = {"completed": completed, "failed": failed, "attempt": execution.get("attempts", 1)}
+        if failed:
+            # 执行失败：保留已批准的机动窗口，回到协调状态等待重试未完成动作
+            execution["last_failure"] = {"failed": failed, "attempt": execution.get("attempts", 1)}
+            current["execution"] = execution
+            return "coordinating", current, event
+        current["execution"] = execution
+        return "executing", current, event
 
     if action == "resolve":
         _need_status(item, {"executing"})
         report_ref = _require_text(payload, "report_ref")
+        execution = current.get("execution") or {}
+        incomplete = [name for name, state in execution.get("steps", {}).items() if state != "done"]
+        if incomplete:
+            raise DomainError("execution_incomplete", "存在未完成的执行动作: %s" % ",".join(incomplete), 409)
         current["resolution"] = {"report_ref": report_ref, "resolved_by": actor}
         return "resolved", current, {"report_ref": report_ref}
 

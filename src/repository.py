@@ -72,8 +72,43 @@ class Repository:
                 );
                 """
             )
+            self._migrate_legacy_payloads(conn)
         finally:
             conn.close()
+
+    def _migrate_legacy_payloads(self, conn):
+        """旧数据升级：缺少观测版本等字段的接近事件补成初始版本，原审计记录保留。"""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute("SELECT id, payload FROM items").fetchall()
+            for row in rows:
+                payload = json.loads(row["payload"])
+                backfilled = []
+                if "observation_version" not in payload:
+                    payload["observation_version"] = 1
+                    backfilled.append("observation_version")
+                if "revisions" not in payload:
+                    payload["revisions"] = []
+                    backfilled.append("revisions")
+                if "opinions" not in payload:
+                    payload["opinions"] = []
+                    backfilled.append("opinions")
+                if "conflict" not in payload:
+                    payload["conflict"] = False
+                    backfilled.append("conflict")
+                if backfilled:
+                    conn.execute(
+                        "UPDATE items SET payload=?, updated_at=? WHERE id=?",
+                        (canonical_json(payload), now_iso(), row["id"]),
+                    )
+                    self.append_audit(conn, row["id"], "migrated", "system", "migration", {"backfilled": backfilled})
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
 
     def _row_to_item(self, row):
         if row is None:
